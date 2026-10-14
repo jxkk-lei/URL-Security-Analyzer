@@ -2,21 +2,46 @@
 package main
 
 import (
+	"context"
 	"encoding/json"
 	"log"
 	"net/http"
+	"os"
 	"time"
+
+	"github.com/jackc/pgx/v5/pgxpool"
 )
 
 type HealthResponse struct {
-	Status    string `json:"status"`
-	Timestamp string `json:"timestamp"`
+	Status   string `json:"status"`
+	Database string `json:"database"`
 }
 
 func main() {
-	mux := http.NewServeMux()
+	databaseURL := os.Getenv("DATABASE_URL")
+	if databaseURL == "" {
+		log.Fatal("DATABASE_URL environment variable is required")
+	}
 
-	mux.HandleFunc("GET /api/v1/health", healthHandler)
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
+	db, err := pgxpool.New(ctx, databaseURL)
+	if err != nil {
+		log.Fatalf("Failed to create database pool: %v", err)
+	}
+	defer db.Close()
+
+	if err := db.Ping(ctx); err != nil {
+		log.Fatalf("Failed to connect to PostgreSQL: %v", err)
+	}
+
+	log.Println("Connected to PostgreSQL")
+
+	mux := http.NewServeMux()
+	mux.HandleFunc("GET /api/v1/health", func(w http.ResponseWriter, r *http.Request) {
+		healthHandler(w, r, db)
+	})
 
 	server := &http.Server{
 		Addr:              ":8080",
@@ -32,13 +57,22 @@ func main() {
 	}
 }
 
-func healthHandler(w http.ResponseWriter, r *http.Request) {
-	w.Header().Set("Content-Type", "application/json")
+func healthHandler(w http.ResponseWriter, r *http.Request, db *pgxpool.Pool) {
+	ctx, cancel := context.WithTimeout(r.Context(), 2*time.Second)
+	defer cancel()
 
 	response := HealthResponse{
-		Status:    "ok",
-		Timestamp: time.Now().UTC().Format(time.RFC3339),
+		Status:   "ok",
+		Database: "ok",
 	}
+
+	if err := db.Ping(ctx); err != nil {
+		response.Status = "error"
+		response.Database = "unavailable"
+		w.WriteHeader(http.StatusServiceUnavailable)
+	}
+
+	w.Header().Set("Content-Type", "application/json")
 
 	if err := json.NewEncoder(w).Encode(response); err != nil {
 		log.Printf("Failed to encode health response: %v", err)
