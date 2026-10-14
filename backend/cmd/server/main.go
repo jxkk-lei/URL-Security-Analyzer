@@ -2,92 +2,120 @@ package main
 
 import (
 	"context"
-	"encoding/json"
+	"errors"
+	"fmt"
 	"log"
 	"net/http"
 	"os"
+	"os/signal"
+	"syscall"
 	"time"
 
-	"github.com/jackc/pgx/v5/pgxpool"
+	"url-security-analyzer/backend/internal/config"
+	"url-security-analyzer/backend/internal/database"
 	"url-security-analyzer/backend/internal/handler"
-	"github.com/joho/godotenv"
+	"url-security-analyzer/backend/internal/repository"
+	"url-security-analyzer/backend/internal/server"
+	"url-security-analyzer/backend/internal/service"
 )
 
-type HealthResponse struct {
-	Status   string `json:"status"`
-	Database string `json:"database"`
+func main() {
+	if err := run(); err != nil {
+		log.Printf("Server stopped with error: %v", err)
+		os.Exit(1)
+	}
 }
 
-func main() {
+func run() error {
+	signalCtx, stop := signal.NotifyContext(
+		context.Background(),
+		os.Interrupt,
+		syscall.SIGTERM,
+	)
+	defer stop()
 
-	if err := godotenv.Load(); err != nil {
-		log.Println(".env не найден")
-	}
-
-	databaseURL := os.Getenv("DATABASE_URL")
-	if databaseURL == "" {
-		log.Fatal("DATABASE_URL environment variable is required")
-	}
-
-	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-	defer cancel()
-
-	db, err := pgxpool.New(ctx, databaseURL)
+	cfg, err := config.Load()
 	if err != nil {
-		log.Fatalf("Failed to create database pool: %v", err)
+		return fmt.Errorf("load configuration: %w", err)
+	}
+
+	dbCtx, cancelDB := context.WithTimeout(
+		signalCtx,
+		10*time.Second,
+	)
+
+	db, err := database.NewPool(dbCtx, cfg.DatabaseURL)
+	cancelDB()
+
+	if err != nil {
+		return fmt.Errorf("initialize PostgreSQL: %w", err)
 	}
 	defer db.Close()
 
-	if err := db.Ping(ctx); err != nil {
-		log.Fatalf("Failed to connect to PostgreSQL: %v", err)
-	}
-
 	log.Println("Connected to PostgreSQL")
 
-	mux := http.NewServeMux()
+	if err := database.Migrate(db); err != nil {
+		return fmt.Errorf("apply database migrations: %w", err)
+	}
+
+	log.Println("Database migrations applied successfully")
+
+	checksRepository := repository.NewChecksRepository(db)
+	checksService := service.NewChecksService(checksRepository)
 
 	checksHandler := &handler.ChecksHandler{
+		Service: checksService,
+	}
+
+	healthHandler := &handler.HealthHandler{
 		DB: db,
 	}
 
-	mux.HandleFunc("POST /api/v1/checks", checksHandler.Create)
+	httpServer := server.New(
+		cfg.ServerAddr,
+		checksHandler,
+		healthHandler,
+	)
 
-	mux.HandleFunc("GET /api/v1/health", func(w http.ResponseWriter, r *http.Request) {
-		healthHandler(w, r, db)
-	})
+	serverErrors := make(chan error, 1)
 
-	server := &http.Server{
-		Addr:              ":8080",
-		Handler:           mux,
-		ReadHeaderTimeout: 5 * time.Second,
+	go func() {
+		log.Printf("URL Security Analyzer API started on %s", cfg.ServerAddr)
+		serverErrors <- httpServer.ListenAndServe()
+	}()
+
+	select {
+	case err := <-serverErrors:
+		if err != nil && !errors.Is(err, http.ErrServerClosed) {
+			return fmt.Errorf("HTTP server failed: %w", err)
+		}
+
+		return nil
+
+	case <-signalCtx.Done():
+		log.Println("Shutdown signal received")
 	}
 
-	log.Println("URL Security Analyzer API started on :8080")
+	shutdownCtx, cancelShutdown := context.WithTimeout(
+		context.Background(),
+		10*time.Second,
+	)
+	defer cancelShutdown()
 
-	if err := server.ListenAndServe(); err != nil &&
-		err != http.ErrServerClosed {
-		log.Fatal(err)
-	}
-}
+	if err := httpServer.Shutdown(shutdownCtx); err != nil {
+		log.Printf("Graceful shutdown failed: %v", err)
 
-func healthHandler(w http.ResponseWriter, r *http.Request, db *pgxpool.Pool) {
-	ctx, cancel := context.WithTimeout(r.Context(), 2*time.Second)
-	defer cancel()
-
-	response := HealthResponse{
-		Status:   "ok",
-		Database: "ok",
+		if closeErr := httpServer.Close(); closeErr != nil {
+			log.Printf("Force close failed: %v", closeErr)
+		}
 	}
 
-	if err := db.Ping(ctx); err != nil {
-		response.Status = "error"
-		response.Database = "unavailable"
-		w.WriteHeader(http.StatusServiceUnavailable)
+	err = <-serverErrors
+	if err != nil && !errors.Is(err, http.ErrServerClosed) {
+		return fmt.Errorf("HTTP server failed during shutdown: %w", err)
 	}
 
-	w.Header().Set("Content-Type", "application/json")
+	log.Println("HTTP server stopped")
 
-	if err := json.NewEncoder(w).Encode(response); err != nil {
-		log.Printf("Failed to encode health response: %v", err)
-	}
+	return nil
 }
