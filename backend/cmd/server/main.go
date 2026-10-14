@@ -1,4 +1,3 @@
-
 package main
 
 import (
@@ -10,6 +9,7 @@ import (
 	"time"
 
 	"github.com/jackc/pgx/v5/pgxpool"
+	"url-security-analyzer/backend/internal/handler"
 )
 
 type HealthResponse struct {
@@ -39,6 +39,13 @@ func main() {
 	log.Println("Connected to PostgreSQL")
 
 	mux := http.NewServeMux()
+
+	checksHandler := &handler.ChecksHandler{
+		DB: db,
+	}
+
+	mux.HandleFunc("POST /api/v1/checks", checksHandler.Create)
+
 	mux.HandleFunc("GET /api/v1/health", func(w http.ResponseWriter, r *http.Request) {
 		healthHandler(w, r, db)
 	})
