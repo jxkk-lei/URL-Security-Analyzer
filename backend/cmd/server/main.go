@@ -10,6 +10,7 @@ import (
 
 	"github.com/jackc/pgx/v5/pgxpool"
 	"url-security-analyzer/backend/internal/handler"
+	"github.com/joho/godotenv"
 )
 
 type HealthResponse struct {
@@ -18,6 +19,11 @@ type HealthResponse struct {
 }
 
 func main() {
+
+	if err := godotenv.Load(); err != nil {
+		log.Println(".env не найден")
+	}
+
 	databaseURL := os.Getenv("DATABASE_URL")
 	if databaseURL == "" {
 		log.Fatal("DATABASE_URL environment variable is required")
