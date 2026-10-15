@@ -19,7 +19,7 @@ func New(
 	mux.HandleFunc("GET /api/v1/health", healthHandler.Check)
 
 	return &http.Server{
-		Addr:              ":8080",
+		Addr:              addr,
 		Handler:           mux,
 		ReadHeaderTimeout: 5 * time.Second,
 	}
